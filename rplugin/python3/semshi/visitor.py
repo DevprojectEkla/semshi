@@ -1,26 +1,65 @@
 # pylint: disable=unidiomatic-typecheck
-from ast import (AsyncFunctionDef, Attribute, ClassDef, DictComp, Eq,
+import sys
+from ast import (AnnAssign, AsyncFunctionDef, Attribute, ClassDef, DictComp, Eq,
                  ExceptHandler, FunctionDef, GeneratorExp, Global, Gt, GtE,
                  Import, ImportFrom, Lambda, ListComp, Load, Lt, LtE, Module,
-                 Name, NameConstant, Nonlocal, NotEq, Num, SetComp, Store, Str,
+                 Name, Nonlocal, NotEq, SetComp, Store,
                  Try, arg)
 from itertools import count
-import sys
 from token import NAME, OP
 from tokenize import tokenize
 
 from .node import ATTRIBUTE, IMPORTED, PARAMETER_UNUSED, SELF, Node
 from .util import debug_time
 
+# Python 3.11+ adds TryStar for "except*" syntax
+try:
+    from ast import TryStar
+except ImportError:
+    TryStar = None
+
+# Python 3.10+ adds match/case
+try:
+    from ast import Match
+except ImportError:
+    Match = None
+
+# Python 3.12+ adds type alias and type parameter nodes
+try:
+    from ast import TypeAlias as TypeAliasNode
+except ImportError:
+    TypeAliasNode = None
+try:
+    from ast import TypeVar as TypeVarNode, ParamSpec as ParamSpecNode, TypeVarTuple as TypeVarTupleNode
+except ImportError:
+    TypeVarNode = ParamSpecNode = TypeVarTupleNode = None
+
 # Node types which introduce a new scope
-BLOCKS = (Module, FunctionDef, AsyncFunctionDef, ClassDef, ListComp, DictComp,
-          SetComp, GeneratorExp, Lambda)
+BLOCKS = [Module, FunctionDef, AsyncFunctionDef, ClassDef, GeneratorExp, Lambda]
+# Python 3.12+ (PEP 709) inlined list/set/dict comprehensions so they no longer
+# create their own scope in the symtable.  Detect this at import time.
+import symtable as _symtable
+_st = _symtable.symtable('[x for x in y]', '?', 'exec')
+_COMP_HAS_SCOPE = any(c.get_name() == 'listcomp' for c in _st.get_children())
+if _COMP_HAS_SCOPE:
+    BLOCKS += [ListComp, SetComp, DictComp]
+BLOCKS = tuple(BLOCKS)
+del _st, _COMP_HAS_SCOPE
+# Python 3.12+ type alias introduces a new scope
+if TypeAliasNode is not None:
+    BLOCKS = BLOCKS + (TypeAliasNode,)
 FUNCTION_BLOCKS = (FunctionDef, Lambda, AsyncFunctionDef)
 # Node types which don't require any action
 if sys.version_info < (3, 8):
+    from ast import NameConstant, Str, Num  # pylint: disable=ungrouped-imports
     SKIP = (NameConstant, Str, Num)
+elif sys.version_info < (3, 12):
+    from ast import Constant  # pylint: disable=ungrouped-imports
+    SKIP = (Constant,)
 else:
-    from ast import Constant # pylint: disable=ungrouped-imports
+    # Python 3.12+ removed the deprecated NameConstant/Str/Num entirely;
+    # Constant is still present.
+    from ast import Constant  # pylint: disable=ungrouped-imports
     SKIP = (Constant,)
 SKIP += (Store, Load, Eq, Lt, Gt, NotEq, LtE, GtE)
 
@@ -84,7 +123,12 @@ class Visitor:
             return
         if type_ in SKIP:
             return
-        if type_ is Try:
+        # Python 3.13+ (PEP 649): annotations are deferred into __annotate__,
+        # so skip the annotation field of AnnAssign nodes.
+        if sys.version_info >= (3, 13) and type_ is AnnAssign:
+            if hasattr(node, 'annotation'):
+                del node.annotation
+        if type_ is Try or (TryStar is not None and type_ is TryStar):
             self._visit_try(node)
         elif type_ is ExceptHandler:
             self._visit_except(node)
@@ -95,10 +139,16 @@ class Visitor:
         elif type_ in FUNCTION_BLOCKS:
             self._visit_arg_defaults(node)
         elif type_ in (ListComp, SetComp, DictComp, GeneratorExp):
-            self._visit_comp(node)
+            # Only pre-visit the iterator when the comprehension creates its
+            # own scope (the iterator is evaluated in the enclosing scope).
+            if type_ in BLOCKS:
+                self._visit_comp(node)
         elif type_ in (Global, Nonlocal):
             keyword = 'global' if type_ is Global else 'nonlocal'
             self._visit_global_nonlocal(node, keyword)
+        # Python 3.12+ type alias statement: type X = int
+        if TypeAliasNode is not None and type_ is TypeAliasNode:
+            self._visit_type_alias(node)
         if type_ in (FunctionDef, ClassDef, AsyncFunctionDef):
             self._visit_class_function_definition(node)
             if type_ is ClassDef:
@@ -109,7 +159,11 @@ class Visitor:
         # Either make a new block scope...
         if type_ in BLOCKS and len(self._table_stack) > 0:
             current_table = self._table_stack.pop()
-            self._table_stack += reversed(current_table.get_children())
+            # Python 3.13+ adds implicit __annotate__ scopes in the symtable
+            # that have no corresponding AST node — skip them.
+            children = [c for c in current_table.get_children()
+                        if c.get_name() != '__annotate__']
+            self._table_stack += reversed(children)
             self._env.append(current_table)
             self._cur_env = self._env[:]
             if type_ in FUNCTION_BLOCKS:
@@ -157,7 +211,18 @@ class Visitor:
         del node.args.kw_defaults
 
     def _visit_try(self, node):
-        """Visit try-except."""
+        """Visit try-except.
+
+        In older Python (< 3.13), the symtable orders children as
+        body → orelse → handlers → finalbody, which doesn't match the AST
+        field order (body → handlers → orelse → finalbody).  We pre-visit
+        body and orelse so the scope stack stays in sync.
+
+        Python 3.13+ changed the symtable to follow source order, so we
+        can let _iter_node handle everything naturally.
+        """
+        if sys.version_info >= (3, 13):
+            return
         for child in node.body:
             self.visit(child)
         del node.body
@@ -202,6 +267,15 @@ class Visitor:
 
     def _visit_args(self, node):
         """Visit function arguments."""
+        if sys.version_info >= (3, 13):
+            # Python 3.13+ (PEP 649): annotations are deferred and live in an
+            # implicit __annotate__ scope.  Don't visit them here.
+            for arg in node.args.posonlyargs + node.args.args + node.args.kwonlyargs + [node.args.vararg, node.args.kwarg]:
+                if arg is not None and hasattr(arg, 'annotation'):
+                    del arg.annotation
+            if hasattr(node, 'returns'):
+                del node.returns
+            return
         # We'd want to visit args.posonlyargs, but it appears an internal bug
         # is preventing that. See: https://stackoverflow.com/q/59066024/5765873
         for arg in node.args.posonlyargs:
@@ -344,6 +418,18 @@ class Visitor:
             if more:
                 # ...advance to next comma.
                 advance(tokens, ',', OP)
+
+    def _visit_type_alias(self, node):
+        """Visit a type alias statement (Python 3.12+): type X = ..."""
+        # Visit the value (the right-hand side of the type alias)
+        if hasattr(node, 'value') and node.value is not None:
+            self.visit(node.value)
+            del node.value
+        # Visit type parameters if present
+        if hasattr(node, 'type_params'):
+            for tp in node.type_params:
+                self.visit(tp)
+            del node.type_params
 
     def _mark_self(self, node):
         """Mark self/cls argument if the current function has one.

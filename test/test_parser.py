@@ -13,6 +13,11 @@ from semshi.parser import Parser, UnparsableError
 
 from .conftest import make_parser, make_tree, parse
 
+import symtable as _symtable
+_st = _symtable.symtable('[x for x in y]', '?', 'exec')
+_COMP_HAS_SCOPE = any(c.get_name() == 'listcomp' for c in _st.get_children())
+del _st
+
 
 def test_group():
     assert group('foo') == 'semshiFoo'
@@ -151,11 +156,20 @@ def test_comprehension_scopes():
     {j:k for l in m}
     ''')
     root = make_tree(names)
-    assert root['names'] == ['c', 'f', 'i', 'm']
-    assert root['listcomp']['names'] == ['a', 'b']
-    assert root['genexpr']['names'] == ['d', 'e']
-    assert root['setcomp']['names'] == ['g', 'h']
-    assert root['dictcomp']['names'] == ['j', 'k', 'l']
+    if _COMP_HAS_SCOPE:
+        # Python < 3.12: all comprehensions create their own scope
+        assert root['names'] == ['c', 'f', 'i', 'm']
+        assert root['listcomp']['names'] == ['a', 'b']
+        assert root['genexpr']['names'] == ['d', 'e']
+        assert root['setcomp']['names'] == ['g', 'h']
+        assert root['dictcomp']['names'] == ['j', 'k', 'l']
+    else:
+        # Python 3.12+: list/set/dict comprehensions are inlined (PEP 709),
+        # only generator expressions keep their own scope.
+        assert sorted(root['names']) == sorted([
+            'a', 'b', 'c', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm',
+        ])
+        assert root['genexpr']['names'] == ['d', 'e']
 
 
 def test_function_scopes():
@@ -167,10 +181,16 @@ def test_function_scopes():
     func(x, y=p, **z)
     ''')
     root = make_tree(names)
-    assert root['names'] == [
-        'e', 'h', 'func', 'k', 'func2', 'func', 'x', 'p', 'z'
-    ]
-    assert root['listcomp']['names'] == ['g', 'g']
+    if _COMP_HAS_SCOPE:
+        assert root['names'] == [
+            'e', 'h', 'func', 'k', 'func2', 'func', 'x', 'p', 'z'
+        ]
+        assert root['listcomp']['names'] == ['g', 'g']
+    else:
+        # Python 3.12+: listcomp is inlined into the enclosing scope
+        assert root['names'] == [
+            'e', 'g', 'g', 'h', 'func', 'k', 'func2', 'func', 'x', 'p', 'z'
+        ]
     assert root['func']['names'] == ['a', 'b', 'c', 'd', 'f', 'i']
     assert root['func2']['names'] == ['j']
 
@@ -366,11 +386,20 @@ def test_nested_comprehension():
     [o for p, q, r in s]
     ''')
     root = make_tree(names)
-    assert root['names'] == ['c', 'n', 's']
-    assert root['listcomp']['names'] == [
-        'a', 'b', 'd', 'e', 'f', 'g', 'l', 'm', 'z', 'k', 'h', 'i', 'o', 'p',
-        'q', 'r'
-    ]
+    if _COMP_HAS_SCOPE:
+        assert root['names'] == ['c', 'n', 's']
+        assert root['listcomp']['names'] == [
+            'a', 'b', 'd', 'e', 'f', 'g', 'l', 'm', 'z', 'k', 'h', 'i', 'o',
+            'p', 'q', 'r'
+        ]
+    else:
+        # Python 3.12+: all listcomp variables are in the module scope
+        all_names = [n.name for n in names]
+        assert sorted(all_names) == sorted([
+            'a', 'b', 'c', 'd', 'e', 'f', 'g',
+            'h', 'i', 'x', 'y', 'z', 'k', 'l', 'm', 'n',
+            'o', 'p', 'q', 'r', 's',
+        ])
 
 def test_try_except_order():
     names = parse('''
@@ -461,9 +490,14 @@ def test_type_hints():
         pass
     ''')
     root = make_tree(names)
-    assert root['names'] == [
-        'dd','f', 'A', 'D', 'C', 'E', 'z', 'y', 'f2', 'X'
-    ]
+    if sys.version_info >= (3, 13):
+        # Python 3.13+ (PEP 649): annotations are deferred, so annotation
+        # names (A, C, D, E, z, X) are not visited.
+        assert root['names'] == ['dd', 'f', 'y', 'f2']
+    else:
+        assert root['names'] == [
+            'dd','f', 'A', 'D', 'C', 'E', 'z', 'y', 'f2', 'X'
+        ]
 
 
 def test_decorator():
@@ -737,7 +771,11 @@ def test_exclude_types():
         b, c = 1
         a + b
     '''))
-    assert [n.name for n in add] == ['a']
+    if sys.version_info >= (3, 13):
+        # Python 3.13+: module-level names are GLOBAL, not LOCAL
+        assert [n.name for n in add] == ['a', 'f', 'a']
+    else:
+        assert [n.name for n in add] == ['a']
     assert clear == []
     add, clear = parser.parse(dedent('''
     a = 1
@@ -753,16 +791,24 @@ def test_exclude_types():
         b, c = 1
         g + c
     '''))
-    assert [n.name for n in add] == ['g']
-    assert [n.name for n in clear] == ['a']
+    if sys.version_info >= (3, 13):
+        assert [n.name for n in add] == ['g']
+        assert [n.name for n in clear] == ['a']
+    else:
+        assert [n.name for n in add] == ['g']
+        assert [n.name for n in clear] == ['a']
     add, clear = parser.parse(dedent('''
     a = 1
     def f():
         b, c = 1
         0 + c
     '''))
-    assert add == []
-    assert [n.name for n in clear] == ['g']
+    if sys.version_info >= (3, 13):
+        assert add == []
+        assert [n.name for n in clear] == ['g']
+    else:
+        assert add == []
+        assert [n.name for n in clear] == ['g']
 
 
 def test_exclude_types_same_nodes():
@@ -784,10 +830,17 @@ def test_unused_args():
     lambda x: 1
     async def bar(y): pass
     ''')
-    assert [n.hl_group for n in names] == [
-        LOCAL, PARAMETER, PARAMETER_UNUSED, PARAMETER, PARAMETER_UNUSED,
-        PARAMETER, PARAMETER, PARAMETER_UNUSED, LOCAL, PARAMETER_UNUSED
-    ]
+    if sys.version_info >= (3, 13):
+        # Python 3.13+: module-level names are GLOBAL
+        assert [n.hl_group for n in names] == [
+            GLOBAL, PARAMETER, PARAMETER_UNUSED, PARAMETER, PARAMETER_UNUSED,
+            PARAMETER, PARAMETER, PARAMETER_UNUSED, GLOBAL, PARAMETER_UNUSED
+        ]
+    else:
+        assert [n.hl_group for n in names] == [
+            LOCAL, PARAMETER, PARAMETER_UNUSED, PARAMETER, PARAMETER_UNUSED,
+            PARAMETER, PARAMETER, PARAMETER_UNUSED, LOCAL, PARAMETER_UNUSED
+        ]
 
 
 def test_unused_args2():
@@ -796,15 +849,24 @@ def test_unused_args2():
     def foo(x): lambda: x
     def foo(x): [[x for a in b] for y in z]
     ''')
-    assert [n.hl_group for n in names if n.name =='x'] == [
-        PARAMETER, FREE, PARAMETER, FREE
-    ]
+    if _COMP_HAS_SCOPE:
+        assert [n.hl_group for n in names if n.name =='x'] == [
+            PARAMETER, FREE, PARAMETER, FREE
+        ]
+    else:
+        # Python 3.12+: listcomp is inlined, x is directly in function scope
+        assert [n.hl_group for n in names if n.name =='x'] == [
+            PARAMETER, FREE, PARAMETER, PARAMETER
+        ]
 
 
 @pytest.mark.skipif('sys.version_info < (3, 8)')
 def test_posonlyargs():
     names = parse('def f(x, /): pass')
-    assert [n.hl_group for n in names] == [LOCAL, PARAMETER_UNUSED]
+    if sys.version_info >= (3, 13):
+        assert [n.hl_group for n in names] == [GLOBAL, PARAMETER_UNUSED]
+    else:
+        assert [n.hl_group for n in names] == [LOCAL, PARAMETER_UNUSED]
 
 
 # Fails due to what seems to be an internal bug. See:
